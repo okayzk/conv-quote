@@ -31,7 +31,13 @@ let running: Promise<boolean> | null = null
 
 const short = (id: string) => id.slice(0, 8)
 const pad = (n: number) => String(n).padStart(2, '0')
-const fmt = (t: number) => { const d = new Date(t); return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` }
+// Display time in Claude Code's `timeZone` setting (IANA name, e.g. "Asia/Shanghai"); undefined = the machine's zone.
+let zone: string | undefined
+const fmt = (t: number) => {
+  const p: Record<string, string> = {}
+  for (const x of new Intl.DateTimeFormat('en-GB', { timeZone: zone, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(t)) p[x.type] = x.value
+  return `${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`
+}
 // For the model: ISO UTC, comparable with the JSONL `timestamp` field.
 const fmtFull = (t: number) => new Date(t).toISOString()
 const firstLine = (s: string, n: number) => { const l = s.trim().split('\n')[0] ?? ''; return l.length > n ? l.slice(0, n - 1) + '…' : l }
@@ -187,6 +193,11 @@ export const register: Register = on => {
     let setting: unknown
     try { setting = await $.settings.read({ key: 'language' }) } catch { setting = undefined }
     lang = typeof setting === 'string' && /chinese|mandarin|cantonese|中文|汉语|漢語|简体|繁体|繁體|^zh/i.test(setting.trim()) ? 'zh' : 'en'
+    let tz: unknown
+    try { tz = await $.settings.read({ key: 'timeZone' }) } catch { tz = undefined }
+    zone = undefined
+    // An unknown zone name throws in Intl; keep the machine's zone then.
+    if (typeof tz === 'string' && tz.trim()) { try { new Intl.DateTimeFormat('en', { timeZone: tz.trim() }); zone = tz.trim() } catch { $.ui.toast(`conv-quote: timeZone "${tz}" ?`) } }
     try { await $.command.register({ name: 'quote', description: L().quoteDesc, argumentHint: L().quoteHint }) } catch (err) { $.ui.toast(L().notRegistered('quote', err)) }
     try { await $.command.register({ name: 'timeline', description: L().timelineDesc }) } catch (err) { $.ui.toast(L().notRegistered('timeline', err)) }
     await $.tool.register({

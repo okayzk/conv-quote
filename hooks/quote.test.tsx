@@ -179,3 +179,12 @@ for (const [setting, want] of [['chinese', '已添加 [Q1]'], ['japanese', 'Adde
     expect(ran.text).toContain(want)
   })
 }
+
+test('message header uses the timeZone setting', async ($, on) => {
+  engine(on)
+  on('settings.read', () => ({ value: { timeZone: 'Asia/Shanghai' } }) as any)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as any)
+  const user = await $.ui.mount({ plugin: 'conv-quote', surface: 'terminal', component: 'UserMessage', requestId: 'aaaaaaaa-1111', props: { text: 'hi', origin: { kind: 'composer' }, isExpanded: false } } as any)
+  expect((await user.find({ type: 'Text', text: /#aaaaaaaa/ }))?.text).toBe('11-19 10:00:00 · #aaaaaaaa · 1')
+  await user.unmount()
+})
