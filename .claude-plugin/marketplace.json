@@ -1,0 +1,5 @@
+{
+  "name": "conv-quote",
+  "owner": { "name": "okayzk" },
+  "plugins": [{ "name": "conv-quote", "source": "./" }]
+}

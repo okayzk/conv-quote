@@ -1,0 +1,1 @@
+{ "name": "conv-quote", "version": "0.1.0", "description": "Quote transcript selections with comments, show message time/id, and a hidden-by-default timeline pane", "types": "./types/index.d.ts" }
