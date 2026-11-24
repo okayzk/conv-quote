@@ -13,16 +13,19 @@ test('a selection is quoted with its message id, attached on submit, then cleare
   on('fs.stat', () => ({ value: { size: JSONL.length } as any }))
   on('fs.read', () => ({ value: JSONL }))
   on('ui.selection', () => ({ value: { text: 'line two', requestId: 'bbbbbbbb-2222' } }))
+  const filled: string[] = []
+  on('prompt.fill', (_, e: any) => { filled.push(e.text); return { isFilled: true } as any })
   let sent = ''
   on('prompt.submit', (_, e) => { sent = e.text; return { text: e.text } as any })
 
-  const ran: any = await $.command.run({ command: 'quote', args: '这里为什么' } as any)
+  // /quote runs the same flow as the band button: [Qn] goes into the prompt.
+  const ran: any = await $.command.run({ command: 'quote', args: '' } as any)
   expect(ran.text).toContain('#bbbbbbbb')
+  expect(filled).toEqual(['[Q1] '])
 
   await $.prompt.submit({ text: '看 [Q1]', origin: { kind: 'composer' } } as any)
   expect(sent).toContain('[Q1] id=bbbbbbbb-2222 role=assistant seq=2')
   expect(sent).toContain('> line two')
-  expect(sent).toContain('comment: 这里为什么')
 
   sent = ''
   await $.prompt.submit({ text: 'next', origin: { kind: 'composer' } } as any)
@@ -34,6 +37,7 @@ test('a tool row selection maps to the assistant message holding the call', asyn
   on('fs.stat', () => ({ value: { size: JSONL.length } as any }))
   on('fs.read', () => ({ value: JSONL }))
   on('ui.selection', () => ({ value: { text: 'ls -la', requestId: 'toolu_1' } }))
+  on('prompt.fill', () => ({ isFilled: true }) as any)
   const ran: any = await $.command.run({ command: 'quote', args: '' } as any)
   expect(ran.text).toContain('#bbbbbbbb')
 })
@@ -89,6 +93,7 @@ test('a rendered selection maps back to its span in the raw markdown, and locate
   on('fs.read', () => ({ value: md }))
   // Rendered text: bold and code marks gone.
   on('ui.selection', () => ({ value: { text: '可能还会冲突：reply-quote', requestId: 'cccccccc-3333' } }))
+  on('prompt.fill', () => ({ isFilled: true }) as any)
   let sent = ''
   on('prompt.submit', (_, e) => { sent = e.text; return { text: e.text } as any })
 
@@ -128,6 +133,7 @@ test('the <quotes> block carries at most 300 quoted chars and 25 context chars p
   on('fs.stat', () => ({ value: { size: md.length } as any }))
   on('fs.read', () => ({ value: md }))
   on('ui.selection', () => ({ value: { text: 'y'.repeat(1000), requestId: 'eeeeeeee-5555' } }))
+  on('prompt.fill', () => ({ isFilled: true }) as any)
   let sent = ''
   on('prompt.submit', (_, e) => { sent = e.text; return { text: e.text } as any })
 
@@ -146,6 +152,7 @@ test('a whole-message quote has no context line', async ($, on) => {
   on('fs.stat', () => ({ value: { size: md.length } as any }))
   on('fs.read', () => ({ value: md }))
   on('ui.selection', () => ({ value: { text: 'whole message', requestId: 'ffffffff-6666' } }))
+  on('prompt.fill', () => ({ isFilled: true }) as any)
   let sent = ''
   on('prompt.submit', (_, e) => { sent = e.text; return { text: e.text } as any })
   await $.command.run({ command: 'quote', args: '' } as any)
@@ -174,6 +181,7 @@ for (const [setting, want] of [['chinese', '已添加 [Q1]'], ['japanese', 'Adde
     engine(on)
     on('settings.read', () => ({ value: setting === undefined ? {} : { language: setting } }) as any)
     on('ui.selection', () => ({ value: { text: 'line two', requestId: 'bbbbbbbb-2222' } }))
+    on('prompt.fill', () => ({ isFilled: true }) as any)
     await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as any)
     const ran: any = await $.command.run({ command: 'quote', args: '' } as any)
     expect(ran.text).toContain(want)
@@ -187,4 +195,51 @@ test('message header uses the timeZone setting', async ($, on) => {
   const user = await $.ui.mount({ plugin: 'conv-quote', surface: 'terminal', component: 'UserMessage', requestId: 'aaaaaaaa-1111', props: { text: 'hi', origin: { kind: 'composer' }, isExpanded: false } } as any)
   expect((await user.find({ type: 'Text', text: /#aaaaaaaa/ }))?.text).toBe('11-19 10:00:00 · #aaaaaaaa · 1')
   await user.unmount()
+})
+
+test('a sent quote is listed under the message as a jump button', async ($, on) => {
+  engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as any)
+  const text = '看 [Q1]\n\n<quotes session="s">\nheader\n\n[Q1] id=bbbbbbbb-2222 role=assistant seq=2 time=x chars=9-17\n> line two\ncontext: line one ⟦…⟧\n\n[Q2] id=? (selection spanned several messages)\n> a\n> b\n</quotes>'
+  const user = await $.ui.mount({ plugin: 'conv-quote', surface: 'terminal', component: 'UserMessage', requestId: 'aaaaaaaa-1111', props: { text, origin: { kind: 'composer' }, isExpanded: false } } as any)
+  expect((await user.find({ type: 'Button', key: 'jq:1' } as any))?.text).toBe('↪ Q1 #bbbbbbbb “line two”')
+  expect((await user.find({ type: 'Button', key: 'jq:2' } as any))?.text).toBe('↪ Q2 “a”')
+  await user.unmount()
+})
+
+for (const requestId of [undefined, 'row-not-indexed']) {
+  test(`a selection with ${requestId ? 'an unknown row id' : 'no row id'} is found by its text, markdown marks ignored`, async ($, on) => {
+    const raw = '两项都改好了。\n\n**2. `/quote` 和「引用选区」按钮现在走同一套流程**\n- 两者用的是同一个函数'
+    const md = JSON.stringify({ type: 'assistant', uuid: '3ba84cde-7777', timestamp: '2026-11-19T02:00:00.000Z', message: { role: 'assistant', content: [{ type: 'text', text: raw }] } }) + '\n'
+    on('session.info', () => ({ value: { transcriptPath: '/t.jsonl' } as any }))
+    on('session.id', () => ({ value: 's' }))
+    on('fs.stat', () => ({ value: { size: md.length } as any }))
+    on('fs.read', () => ({ value: md }))
+    on('ui.selection', () => ({ value: { text: '2. /quote 和「引用选区」按钮现在走同一套流程', requestId } }))
+    on('prompt.fill', () => ({ isFilled: true }) as any)
+    let sent = ''
+    on('prompt.submit', (_, e) => { sent = e.text; return { text: e.text } as any })
+    const ran: any = await $.command.run({ command: 'quote', args: '' } as any)
+    expect(ran.text).toContain('#3ba84cde')
+    await $.prompt.submit({ text: '[Q1]', origin: { kind: 'composer' } } as any)
+    expect(sent).toContain('[Q1] id=3ba84cde-7777')
+    expect(sent).toContain(`chars=${raw.indexOf('2.')}-`)
+  })
+}
+
+test('a selection spanning several messages goes to the first, its part spanned there', async ($, on) => {
+  engine(on)
+  // From message 2's last line, over its header, into a later message (here message 1's text).
+  on('session.id', () => ({ value: 's' }))
+  on('ui.selection', () => ({ value: { text: 'line two\n11-19 10:00:05 · #bbbbbbbb · 2\nhello there' } }))
+  on('prompt.fill', () => ({ isFilled: true }) as any)
+  let sent = ''
+  on('prompt.submit', (_, e) => { sent = e.text; return { text: e.text } as any })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as any)
+  const ran: any = await $.command.run({ command: 'quote', args: '' } as any)
+  expect(ran.text).toContain('#bbbbbbbb')
+  await $.prompt.submit({ text: '[Q1]', origin: { kind: 'composer' } } as any)
+  expect(sent).toContain('[Q1] id=bbbbbbbb-2222 role=assistant seq=2')
+  expect(sent).toContain('(first of several messages selected)')
+  expect(sent).toContain('chars=9-17')
 })

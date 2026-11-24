@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Quote } from '../types'
+import type { Flash, Quote } from '../types'
 
 // =============================================================================
 // State and transcript index
@@ -9,6 +9,9 @@ import type { Quote } from '../types'
 
 const quotes = atom({ plugin: 'conv-quote', key: 'quotes' } as const, [], { shape: 'quotes-2' })
 const rev = atom({ plugin: 'conv-quote', key: 'rev' } as const, 0)
+// The quoted message to outline after a jump from a sent quote; cleared after FLASH ms.
+const flash = atom({ plugin: 'conv-quote', key: 'flash' } as const, null as Flash | null)
+const FLASH = 5000
 
 const PANE = 'conv-timeline'
 const TOOL = 'mcp__conv-quote__locate'
@@ -85,20 +88,41 @@ async function refresh($: any): Promise<boolean> {
   try { return await running } finally { running = null }
 }
 
-// Map a selection's row id (a message uuid, or a tool row's tool_use_id) to an entry;
-// a selection spanning rows has no id, so fall back to the newest message containing its first line.
-function locate(sel: { text: string; requestId?: string }): Entry | undefined {
-  if (sel.requestId) return byId.get(sel.requestId) ?? byId.get(toolOwner.get(sel.requestId) ?? '')
-  const probe = sel.text.trim().split('\n')[0]?.trim() ?? ''
-  if (probe.length < 6) return undefined
-  for (let i = order.length - 1; i >= 0; i--) if (order[i]!.text.includes(probe)) return order[i]
-  return undefined
+// Map a selection to its message, and the part of the selection lying in it. By its row id (a message
+// uuid, or a tool row's tool_use_id) when that id is indexed. Otherwise (no id: the selection spans rows
+// or lies in a row the engine did not name; or an id the index does not hold) by text, newest message
+// first, whitespace and markdown marks ignored: the whole selection; failing that the selection spans
+// several messages, so its first line with text (headers skipped) names the first message, and the
+// longest run of lines from there that this message holds is the part quoted from it.
+const HEADER = /^\s*(\d\d-\d\d \d\d:\d\d:\d\d · )?#[0-9a-f]{8}( · \d+)?\s*$/
+const lines = (t: string) => t.split('\n').filter(l => strip(l).length >= 4 && !HEADER.test(l))
+type Located = { entry?: Entry; part?: string; spans?: true }
+function locate(sel: { text: string; requestId?: string }): Located {
+  if (sel.requestId) {
+    const hit = byId.get(sel.requestId) ?? byId.get(toolOwner.get(sel.requestId) ?? '')
+    if (hit) return { entry: hit, part: sel.text }
+  }
+  const newest = (probe: string) => { for (let i = order.length - 1; i >= 0; i--) if (strip(order[i]!.text).includes(probe)) return order[i] }
+  const whole = strip(sel.text)
+  const one = whole.length >= 4 ? newest(whole) : undefined
+  if (one) return { entry: one, part: sel.text }
+  const ls = lines(sel.text)
+  for (let i = 0; i < ls.length; i++) {
+    const entry = newest(strip(ls[i]!))
+    if (!entry) continue
+    const flat = strip(entry.text)
+    let j = i + 1
+    while (j < ls.length && flat.includes(strip(ls.slice(i, j + 1).join('\n')))) j++
+    return { entry, part: ls.slice(i, j).join('\n'), spans: true }
+  }
+  return {}
 }
 
 // Find the selection inside the raw message text. The selection is the *rendered* text (markdown
 // marks gone, lines rewrapped), so both sides are compared with whitespace and markdown marks
 // removed, keeping a map back to raw offsets. Returns [start, end) in raw chars, or undefined.
 const SKIP = /[\s*`#>|\-•_~]/
+const strip = (s: string) => { let o = ''; for (const c of s) if (!SKIP.test(c)) o += c; return o }
 function span(raw: string, sel: string): [number, number] | undefined {
   let flat = ''
   const at: number[] = [] // at[k] = raw index of flat[k]
@@ -113,23 +137,77 @@ function span(raw: string, sel: string): [number, number] | undefined {
 
 const CTX = 25 // chars of raw text kept on each side of a quote in the <quotes> block
 const QMAX = 300 // chars of the quoted text itself carried in the <quotes> block
-async function addQuote($: any, text: string, entry: Entry | undefined, comment: string): Promise<number> {
-  const s = entry ? span(entry.text, text) : undefined
+async function addQuote($: any, text: string, entry: Entry | undefined, part = text, spans?: true): Promise<number> {
+  const s = entry ? span(entry.text, part) : undefined
   const before = entry && s ? entry.text.slice(Math.max(0, s[0] - CTX), s[0]) : undefined
   const after = entry && s ? entry.text.slice(s[1], s[1] + CTX) : undefined
-  await update($, quotes, list => [...list, { n: (list.at(-1)?.n ?? 0) + 1, id: entry?.id, role: entry?.role, time: entry?.time, seq: entry?.seq, text, comment, start: s?.[0], end: s?.[1], before, after }])
+  await update($, quotes, list => [...list, { n: (list.at(-1)?.n ?? 0) + 1, id: entry?.id, role: entry?.role, time: entry?.time, seq: entry?.seq, text, start: s?.[0], end: s?.[1], before, after, spans }])
   return (await read($, quotes)).at(-1)?.n ?? 0
 }
 
-// Returns the quote number (0 when nothing is selected) and the message to show.
-async function quoteSelection($: any, comment: string): Promise<{ n: number; msg: string }> {
+// The one quoting flow, shared by the band button and /quote: quote the mouse selection, then
+// insert `[Qn] ` into the prompt. Returns the quote number
+// (0 when nothing is selected) and the message to show.
+async function quoteSelection($: any): Promise<{ n: number; msg: string }> {
   const sel = await $.ui.selection()
   if (!sel || !sel.text.trim()) return { n: 0, msg: L().noSelection }
   await refresh($)
-  const entry = locate(sel)
-  const n = await addQuote($, sel.text, entry, comment)
-  return { n, msg: entry ? L().added(n, short(entry.id), entry.seq, entry.role) : L().addedUnlocated(n) }
+  const { entry, part, spans } = locate(sel)
+  const n = await addQuote($, sel.text, entry, part, spans)
+  await $.prompt.fill({ text: `[Q${n}] `, mode: 'insert' })
+  return { n, msg: entry ? L().added(n, short(entry.id), entry.seq, entry.role) + (spans ? L().addedSpans : '') : L().addedUnlocated(n) }
 }
+
+// A quote as it was sent, read back from a stored prompt's <quotes> block.
+type Sent = { n: number; id?: string; text: string }
+function parseSent(block: string): Sent[] {
+  const out: Sent[] = []
+  for (const part of block.split(/\n(?=\[Q\d+\] id=)/)) {
+    const lines = part.split('\n')
+    const i = lines.findIndex(l => /^\[Q\d+\] id=/.test(l))
+    const h = lines[i]?.match(/^\[Q(\d+)\] id=(\S+)/)
+    if (!h) continue
+    const body: string[] = []
+    for (const l of lines.slice(i + 1)) { if (!l.startsWith('>')) break; body.push(l.replace(/^> ?/, '')) }
+    const text = body.join('\n').replace(/…\[\+\d+ chars cut[^\]]*\]$/, '')
+    out.push({ n: Number(h[1]), id: h[2] === '?' ? undefined : h[2], text })
+  }
+  return out
+}
+
+// Whether a drawn block holds the quote: its first line, whitespace and markdown marks removed.
+function holds(blockText: string, quote: string) {
+  const probe = strip(lines(quote)[0] ?? '').slice(0, 40)
+  return probe.length > 0 && strip(blockText).includes(probe)
+}
+
+const header = (m: Entry | undefined, requestId: string) => m ? `${fmt(m.time)} · #${short(m.id)} · ${m.seq}` : `#${short(requestId)}`
+
+// Scroll to the quoted message and outline the block holding the quote for FLASH ms.
+// The engine has no call to set a selection, so the outline plus the quoted text stand in for it.
+async function jumpTo($: any, q: Sent) {
+  if (!q.id) { $.ui.toast(L().quoteGone(q.n)); return }
+  let r: any
+  try { r = await $.ui.scroll({ to: { requestId: q.id }, block: 'center' }) } catch (err) { r = { deny: String(err) } }
+  if (r?.deny) { $.ui.toast(L().jumpFailed(short(q.id), r.deny)); return }
+  const token = Date.now()
+  await update($, flash, () => ({ id: q.id!, n: q.n, text: q.text, token }))
+  await $.clock.sleep(FLASH)
+  await update($, flash, f => (f?.token === token ? null : f))
+}
+
+// Wrap a drawn row in the jump outline when it is the quote's target block.
+function outline(ui: any, f: Flash | null, isTarget: boolean, row: any) {
+  const { Box, Text } = ui
+  if (!f || !isTarget) return row
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor="warning">
+      <Box><Text inverse color="warning">{L().flashTag(f.n)}</Text><Text color="warning"> “{firstLine(f.text, 70)}”</Text></Box>
+      {row}
+    </Box>
+  )
+}
+
 
 // =============================================================================
 // UI strings: Chinese when Claude Code's `language` setting names Chinese, English otherwise
@@ -138,16 +216,15 @@ const STR = {
   en: {
     noSelection: 'Nothing selected: in fullscreen mode, select transcript text with the mouse first.',
     added: (n: number, id: string, seq: number, role: string) => `Added [Q${n}] ← #${id} (message ${seq}, ${role})`,
-    addedUnlocated: (n: number) => `Added [Q${n}] (spans several messages; no single source message found)`,
+    addedUnlocated: (n: number) => `Added [Q${n}] (source message not found)`,
+    addedSpans: '; the selection spans several messages, this is the first',
     addedTimeline: (n: number) => `Added [Q${n}]; click the prompt to comment`,
-    quoteDesc: 'Quote the transcript text selected with the mouse; optional argument is your comment',
-    quoteHint: '[comment]',
+    quoteDesc: 'Quote the text selected with the mouse',
     timelineDesc: 'Open/close the conversation timeline pane',
     notRegistered: (cmd: string, err: unknown) => `conv-quote: /${cmd} not registered: ${err}`,
     timelineTitle: 'Conversation timeline',
     timelineOpened: 'Timeline opened.',
     timelineClosed: 'Timeline closed.',
-    attached: 'Quoted',
     bandAdd: 'Quote selection',
     bandTimeline: 'Timeline',
     bandClear: 'Clear quotes',
@@ -155,20 +232,21 @@ const STR = {
     paneHint: 'Esc closes · "Q" quotes the whole message (click the prompt to comment) · click a row to jump',
     paneEmpty: 'No messages yet.',
     paneQuote: 'Q',
+    quoteGone: (n: number) => `[Q${n}] spanned several messages; there is no single message to jump to`,
+    flashTag: (n: number) => ` Q${n} `,
   },
   zh: {
     noSelection: '没有选中内容：请在 fullscreen 模式下先用鼠标选中对话文字。',
     added: (n: number, id: string, seq: number, role: string) => `已添加 [Q${n}] ← #${id}（第 ${seq} 条，${role}）`,
-    addedUnlocated: (n: number) => `已添加 [Q${n}]（跨多条消息，未定位到单条原消息）`,
+    addedUnlocated: (n: number) => `已添加 [Q${n}]（未定位到原消息）`,
+    addedSpans: '；选区跨多条消息，定位到第一条',
     addedTimeline: (n: number) => `已添加 [Q${n}]，点输入框写评论`,
-    quoteDesc: '引用当前鼠标选中的对话内容，参数为评论（可选）',
-    quoteHint: '[评论]',
+    quoteDesc: '引用鼠标选中的内容',
     timelineDesc: '打开/关闭对话时间线面板',
     notRegistered: (cmd: string, err: unknown) => `conv-quote: /${cmd} 未注册：${err}`,
     timelineTitle: '对话时间线',
     timelineOpened: '时间线已打开。',
     timelineClosed: '时间线已关闭。',
-    attached: '引用',
     bandAdd: '引用选区',
     bandTimeline: '时间线',
     bandClear: '清空引用',
@@ -176,6 +254,8 @@ const STR = {
     paneHint: 'Esc 关闭 · 「引」引用整条（点输入框写评论）· 点消息行跳转',
     paneEmpty: '还没有消息。',
     paneQuote: '引',
+    quoteGone: (n: number) => `[Q${n}] 跨多条消息，没有可跳转的单条消息`,
+    flashTag: (n: number) => ` 引用 Q${n} `,
   },
 }
 let lang: keyof typeof STR = 'en'
@@ -198,12 +278,12 @@ export const register: Register = on => {
     zone = undefined
     // An unknown zone name throws in Intl; keep the machine's zone then.
     if (typeof tz === 'string' && tz.trim()) { try { new Intl.DateTimeFormat('en', { timeZone: tz.trim() }); zone = tz.trim() } catch { $.ui.toast(`conv-quote: timeZone "${tz}" ?`) } }
-    try { await $.command.register({ name: 'quote', description: L().quoteDesc, argumentHint: L().quoteHint }) } catch (err) { $.ui.toast(L().notRegistered('quote', err)) }
+    try { await $.command.register({ name: 'quote', description: L().quoteDesc }) } catch (err) { $.ui.toast(L().notRegistered('quote', err)) }
     try { await $.command.register({ name: 'timeline', description: L().timelineDesc }) } catch (err) { $.ui.toast(L().notRegistered('timeline', err)) }
     await $.tool.register({
       name: 'locate',
-      isDeferred: false,
-      description: 'Local positioning for a <quotes> entry, not long-range recall. Usually unnecessary: the quote, chars and context in the <quotes> block are enough. Call only when the quoted message is no longer in your context (e.g. after compaction) or you need a little more text right around the quote. Takes id (uuid or 8+ hex prefix) and the quote\'s start/end; returns at most 500 chars: ~150 chars each side of the span marked ⟦…⟧, plus optional context (0-2, default 0) neighbouring messages\' nearest 150 chars.',
+      isDeferred: true,
+      description: 'Show raw text around a <quotes> entry (at most 500 chars). Use only when the quoted message is no longer in your context. id: uuid or 8+ hex prefix; start/end: its chars; context: 0-2 neighbouring messages.',
       inputSchema: { type: 'object', properties: { id: { type: 'string' }, start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 0 }, context: { type: 'integer', minimum: 0, maximum: 2, description: 'Neighbouring messages on each side (default 0).' } }, required: ['id'] },
     })
     await refresh($)
@@ -211,14 +291,14 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'quote' }, async ($, e) => ({ text: (await quoteSelection($, e.args.trim())).msg }))
+  on('command.run', { command: 'quote' }, async $ => ({ text: (await quoteSelection($)).msg, isTextDisplayOnly: true }))
 
   on('command.run', { command: 'timeline' }, async $ => {
     const open = (await $.ui.panes()).some((p: any) => p.id === PANE)
-    if (open) { await $.ui.close({ id: PANE }); return { text: L().timelineClosed } }
+    if (open) { await $.ui.close({ id: PANE }); return { text: L().timelineClosed, isTextDisplayOnly: true } }
     await refresh($)
     await $.ui.open({ id: PANE, title: L().timelineTitle, focus: true, closeOnEscape: true })
-    return { text: L().timelineOpened }
+    return { text: L().timelineOpened, isTextDisplayOnly: true }
   })
 
   // ===========================================================================
@@ -256,7 +336,7 @@ export const register: Register = on => {
     try {
       const sid = await $.session.id()
       const body = list.map(q => {
-        const where = q.id ? `id=${q.id} role=${q.role} seq=${q.seq} time=${q.time ? fmtFull(q.time) : '?'}` : 'id=? (selection spanned several messages)'
+        const where = q.id ? `id=${q.id} role=${q.role} seq=${q.seq} time=${q.time ? fmtFull(q.time) : '?'}${q.spans ? ' (first of several messages selected)' : ''}` : 'id=? (source message not found)'
         const pos = q.start !== undefined ? ` chars=${q.start}-${q.end}` : q.id ? ' chars=? (not found verbatim in the raw text)' : ''
         const qt = q.text.trimEnd(), cut = qt.length > QMAX ? `…[+${qt.length - QMAX} chars cut; locate can show more]` : ''
         const quoted = (qt.slice(0, QMAX) + cut).split('\n').map(l => `> ${l}`).join('\n')
@@ -264,48 +344,56 @@ export const register: Register = on => {
         const len = byId.get(q.id ?? '')?.text.length ?? Infinity
         const bf = q.before ?? '', af = q.after ?? ''
         const ctx = q.start !== undefined && (bf || af) ? `\ncontext: ${q.start > bf.length ? '…' : ''}${bf.replace(/\s+/g, ' ')}⟦…⟧${af.replace(/\s+/g, ' ')}${(q.end ?? 0) + af.length < len ? '…' : ''}` : ''
-        return `[Q${q.n}] ${where}${pos}\n${quoted}${ctx}${q.comment ? `\ncomment: ${q.comment}` : ''}`
+        return `[Q${q.n}] ${where}${pos}\n${quoted}${ctx}`
       })
-      block = `<quotes session="${sid}">\nThe user quoted these passages from this conversation; [Qn] in the prompt refers to them. chars=start-end is the quote's span in the raw message text; context shows the raw text around it (⟦…⟧ = the quote). This is usually enough; call ${TOOL} (id, start, end) only if the message is no longer in your context or you need slightly more around the quote.\n\n${body.join('\n\n')}\n</quotes>`
+      block = `<quotes session="${sid}">\nQuoted by the user; [Qn] in the prompt refers to them. chars: span in the raw message; ⟦…⟧: the quote in context. If the message has left your context, call ${TOOL}(id, start, end).\n\n${body.join('\n\n')}\n</quotes>`
       await update($, quotes, () => [])
     } catch { block = '' }
     return next(block ? { ...e, text: `${e.text}\n\n${block}` } : e)
   })
 
   // ===========================================================================
-  // Transcript rows: time and id header; collapse the attached <quotes> block
+  // Transcript rows: time and id header; sent quotes as jump links; outline after a jump
   // ===========================================================================
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     if (e.props.origin.kind !== 'composer' && e.props.origin.kind !== 'unclassified') return next(e)
-    const { Box, Text } = $.ui.resolve(e)
+    const ui = $.ui.resolve(e)
+    const { Box, Button, Text } = ui
     const m = byId.get(e.requestId)
     if (!m) await read($, rev) // redraw once the JSONL line is indexed
-    let ev = e
+    const f = await read($, flash)
     const qs = e.props.text.match(QUOTES_RE)
-    if (qs && !e.props.isExpanded) {
-      const tags = [...qs[0].matchAll(/^\[Q(\d+)\] id=([0-9a-f?]+)/gm)].map(x => `Q${x[1]}${x[2] === '?' ? '' : ' #' + short(x[2] ?? '')}`)
-      ev = { ...e, props: { ...e.props, text: `${e.props.text.replace(QUOTES_RE, '')}\n📎 ${L().attached} ${tags.join(', ')}` } }
-    }
-    const row = await next(ev)
+    const sent = qs ? parseSent(qs[0]) : []
+    const ev = qs && !e.props.isExpanded ? { ...e, props: { ...e.props, text: e.props.text.replace(QUOTES_RE, '') } } : e
+    const row = outline(ui, f, f?.id === e.requestId, await next(ev))
     // Header under the row: above it, it would sit before the row's top margin and read as the previous message's.
     return (
       <Box flexDirection="column">
         {row}
-        <Box paddingLeft={2}><Text dimColor>{m ? `${fmt(m.time)} · #${short(m.id)} · ${m.seq}` : `#${short(e.requestId)}`}</Text></Box>
+        {sent.map(q => (
+          <Box paddingLeft={2}>
+            <Button key={`jq:${q.n}`} label={`↪ Q${q.n}${q.id ? ` #${short(q.id)}` : ''} “${firstLine(q.text, 60)}”`} onPress={() => jumpTo($, q)} />
+          </Box>
+        ))}
+        <Box paddingLeft={2}><Text dimColor>{header(m, e.requestId)}</Text></Box>
       </Box>
     )
   })
 
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
-    if (!e.props.isFirstOfReply) return next(e)
-    const { Box, Text } = $.ui.resolve(e)
+    const ui = $.ui.resolve(e)
+    const f = await read($, flash)
+    // A reply drawn in several blocks: outline the one holding the quote.
+    const target = f?.id === e.requestId && holds(e.props.text, f.text)
+    if (!e.props.isFirstOfReply) return outline(ui, f, target, await next(e))
+    const { Box, Text } = ui
     const m = byId.get(e.requestId)
     if (!m) await read($, rev)
-    const row = await next(e)
+    const row = outline(ui, f, target, await next(e))
     return (
       <Box flexDirection="column">
         {row}
-        <Box paddingLeft={2}><Text dimColor>{m ? `${fmt(m.time)} · #${short(m.id)} · ${m.seq}` : `#${short(e.requestId)}`}</Text></Box>
+        <Box paddingLeft={2}><Text dimColor>{header(m, e.requestId)}</Text></Box>
       </Box>
     )
   })
@@ -318,9 +406,8 @@ export const register: Register = on => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const list = await read($, quotes)
     const add = async () => {
-      const { n, msg } = await quoteSelection($, '')
-      if (n) await $.prompt.fill({ text: `[Q${n}] `, mode: 'insert' })
-      else $.ui.toast(msg)
+      const { n, msg } = await quoteSelection($)
+      if (!n) $.ui.toast(msg)
     }
     const toggle = async () => {
       const open = (await $.ui.panes()).some((p: any) => p.id === PANE)
@@ -331,7 +418,7 @@ export const register: Register = on => {
       <Box flexDirection="column">
         {list.map(q => (
           <Box>
-            <Text dimColor>[Q{q.n}]{q.id ? ` #${short(q.id)}` : ''} “{firstLine(q.text, 50)}”{q.comment ? ` — ${firstLine(q.comment, 30)}` : ''} </Text>
+            <Text dimColor>[Q{q.n}]{q.id ? ` #${short(q.id)}` : ''} “{firstLine(q.text, 50)}” </Text>
             <Button key={`rm:${q.n}`} label="✕" onPress={() => update($, quotes, l => l.filter(x => x.n !== q.n))} />
           </Box>
         ))}
@@ -360,7 +447,7 @@ export const register: Register = on => {
     }
     // Quoting leaves the pane open (Esc always closes it); the person clicks the prompt to comment.
     const quote = async (m: Entry) => {
-      const n = await addQuote($, m.text, m, '')
+      const n = await addQuote($, m.text, m)
       await $.prompt.fill({ text: `[Q${n}] `, mode: 'insert' })
       $.ui.toast(L().addedTimeline(n))
     }
